@@ -1,0 +1,198 @@
+import os, json, datetime, requests, discord
+
+from discord.ext import commands, tasks
+from zoneinfo import ZoneInfo
+
+from dotenv import load_dotenv
+load_dotenv()
+
+# - tokens
+dT = os.getenv("DISCORD_TOKEN")
+tT = os.getenv("TOGGL_TOKEN")
+
+channelID = 1549388013581242450
+
+# - creating bot with permissions
+intents = discord.Intents.default()
+intents.message_content = True
+bot = commands.Bot(
+    command_prefix='!',
+    intents=intents,
+)
+
+# REMINDER
+reminder = datetime.time(
+    hour=7,
+    minute=00,
+    tzinfo=ZoneInfo("Europe/Stockholm")
+)
+
+@tasks.loop(time=reminder)
+async def morning_reminder():
+    channel = bot.get_channel(channelID)
+    if channel:
+        await channel.send("Ready for your daily report?")
+    else:
+        print(f'ERROR: channel "{channel}" not found.')
+
+
+states = {}
+
+# ON READY: START REMINDER
+@bot.event
+async def on_ready():
+    print("BOT IS READY")
+    morning_reminder.start()
+
+
+@bot.command()
+async def report(ctx):
+    # Get dates when !report is started
+    today = datetime.date.today()
+    yesterday = today - datetime.timedelta(days=1)
+
+    # Create a new report
+    current_report = {
+        "yesterday": None,
+        "exercise": None,
+        "problem": {
+            "had_problem": False,
+        },
+        "today": None,
+        "entries": []
+    }
+
+    # Get Toggl data
+    start_date, end_date = yesterday.isoformat(), today.isoformat()
+    paramsDict = {
+        "start_date": start_date,
+        "end_date": end_date
+    }
+    response = requests.get(
+        url="https://api.track.toggl.com/api/v9/me/time_entries",
+        auth=(tT, "api_token"),
+        params=paramsDict
+    ).json()
+
+    for entry in response:
+        hours = entry["duration"] // 3600
+        minutes = (entry["duration"] % 3600) // 60
+        seconds = entry["duration"] % 60
+
+        current_report["entries"].append(
+            f'{entry["description"]} - {hours}h {minutes}m {seconds}s'
+        )
+
+    # Store the state, date and report together
+    states[ctx.author] = {
+        "state": "yesterday",
+        "date": today,
+        "report": current_report
+    }
+
+    await ctx.send("What did you do yesterday?")
+    return
+
+
+@bot.event
+async def on_message(msg):
+    if msg.author == bot.user:
+        return
+
+    # Check if msg.author has report
+    if msg.author in states:
+        state = states[msg.author]["state"]
+        report = states[msg.author]["report"]
+        report_date = states[msg.author]["date"]
+
+        if state == 'yesterday':
+            states[msg.author]["state"] = 'exercise'
+
+            report["yesterday"] = msg.content
+
+            await msg.channel.send('What exercises did you do?')
+            return
+
+        if state == 'exercise':
+            states[msg.author]["state"] = 'problem?'
+
+            report["exercise"] = msg.content
+
+            await msg.channel.send(
+                'Did you run into any problems? ["y": yes / "n": no ]'
+            )
+            return
+
+        if state == 'problem?':
+            answer = msg.content.strip().lower()
+            if answer == "y":
+                states[msg.author]["state"] = 'problem_description'
+                report["problem"]["had_problem"] = True
+
+                await msg.channel.send('What was the problem you ran into?')
+                return
+            
+            elif answer == "n":
+                states[msg.author]["state"] = 'today'
+
+                await msg.channel.send(
+                    'What are your plans for today?'
+                )
+                return
+            
+            else:
+                await msg.channel.send('Please answer "y" or "n"')
+                return
+
+        if state == 'problem_description':
+
+            states[msg.author]["state"] = 'solution'
+
+            report["problem"]["problem_description"] = msg.content
+
+            await msg.channel.send(
+                'What solutions did you come up with?'
+            )
+            return
+
+        if state == 'solution':
+
+            states[msg.author]["state"] = 'today'
+
+            report["problem"]["solution"] = msg.content
+
+            await msg.channel.send(
+                'What are your plans for today?'
+            )
+            return
+
+        if state == 'today':
+
+            report["today"] = msg.content
+
+            path = f'daily_report_bot/{msg.author}.json'
+
+            try:
+                with open(path, "r") as fr:
+                    content = json.load(fr)
+
+            except FileNotFoundError:
+                content = {}
+
+            content[report_date.isoformat()] = report
+
+            with open(path, "w") as fw:
+                json.dump(content, fw, indent=4)
+
+            # Delete the active report
+            del states[msg.author]
+
+            await msg.channel.send(
+                "Daily report has been saved."
+            )
+            return
+
+    await bot.process_commands(msg)
+
+
+bot.run(dT)
